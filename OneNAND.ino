@@ -1,6 +1,7 @@
 #include "delay_x.h"
 
-#define CHECK_BIT(var,pos) ((var) & (1<<(pos)))
+#define CHECK_BIT(var,pos) (((var) >> (pos)) &1)
+
 // define data, addr and control ports
 #define DATA1_PORT  PORTF
 #define DATA1_PIN   PINF
@@ -43,6 +44,10 @@
 #define COMM_REG  0xF220  // Command Register 2.8.18
 #define SYS_CONF  0xF221  // System Conf. 1 Register 2.8.19
 #define WP_STAT   0xF24E  // R default 0x2 2.8.25
+
+#define S_IDLE 0
+#define S_READ 1
+
 
 
 // setup pins
@@ -92,13 +97,15 @@ void fbaSet(uint16_t address) {
 
 uint16_t registerSet(uint16_t address, uint16_t data) {
   dataDir(OUT);
-  CONT_PORT &= ~(1<<WE);    // WE goes HIGH
+  
   ADDR2_PORT = (address >> 8);
   ADDR1_PORT = address & 0xFF;
   DATA2_PORT = (data >> 8);
   DATA1_PORT = data & 0xFF;
   CONT_PORT &= ~(1<<WE);    // WE goes LOW
-  return registerRead(address);
+  CONT_PORT |= (1<<WE);     // WE goes HIGH
+  
+  //return registerRead(address);
 }
 
 uint16_t registerRead(uint16_t address) {
@@ -106,7 +113,7 @@ uint16_t registerRead(uint16_t address) {
   ADDR2_PORT = (address >> 8);
   ADDR1_PORT = address & 0xFF;
   CONT_PORT &= ~(1<<AVD); // AVD goes LOW
-  CONT_PORT &= ~(1<<OE);  // LOW
+  CONT_PORT &= ~(1<<OE);  // OE goes LOW
   _delay_ns(100);
   //Serial.print("LSB byte is: ");
   //Serial.println(DATA1_PIN, BIN);
@@ -131,13 +138,13 @@ void loadPage() {
 uint8_t buf_read[64], buf_ix; // used to utilize USB buffer size of 64bytes
 uint16_t readSector(uint16_t address, bool test) {
   //dataDir(IN);                // moved to loadPage
-  ADDR2_PORT = (address >> 8);      // DataRAM0 start address 0x200 ~ 0x500 for total of 4 SECTORS
+  ADDR2_PORT = (address >> 8);  // DataRAM0 start address 0x200 ~ 0x500 for total of 4 SECTORS
   ADDR1_PORT = address & 0xFF;
   CONT_PORT &= ~(1<<AVD);     // AVD goes LOW
   CONT_PORT &= ~(1<<OE);      // OE goes LOW
   _delay_ns(100);             // OE enabled to Output Valid ~= 20ns
-  buf_read[buf_ix++] = DATA2_PIN;
-  buf_read[buf_ix++] = DATA1_PIN;
+  //buf_read[buf_ix++] = DATA2_PIN;
+  //buf_read[buf_ix++] = DATA1_PIN;
   //Serial.write(DATA2_PIN);
   //Serial.write(DATA1_PIN);
   CONT_PORT |= (1<<AVD);      // AVD goes HIGH
@@ -149,16 +156,6 @@ uint16_t readSector(uint16_t address, bool test) {
   return ((DATA2_PIN<<8) | (DATA1_PIN & 0xFF));
 }
 
-void writeSector(uint16_t address, uint16_t data) {
-  //dataDir(OUT);
-  ADDR2_PORT = (address >> 8);      // DataRAM0 start address 0x200 ~ 0x500 for total of 4 SECTORS
-  ADDR1_PORT = address & 0xFF;
-  DATA2_PORT = (data >> 8);      
-  DATA1_PORT = data & 0xFF;   
-  CONT_PORT &= ~(1<<WE);    // WE goes LOW
-  CONT_PORT |= (1<<WE);     // WE goes HIGH
-  
-}
 
 void dump() {
   for ( int block = 0; block < 1024; block++) { 
@@ -189,15 +186,45 @@ void wpStatus() {
   } 
 }
 
+void unlockChip() {
+  registerSet(0xf24c, 0x0000);   // FBA (ALL) Start address
+  registerSet(0xf220, 0x0027);   // FBA (ALL) Unlock command
+}
 
+void eraseBlock() {
+  unlockChip();
+  fbaSet(0x3ff);
+  registerSet(0xf241, 0x0000);  // INT to LOW
+  registerSet(0xf220, 0x0094);  // EREASE command
+  
+  
+  while ( CHECK_BIT(registerRead(0xf241), 15) == 0) {};
+  if ( CHECK_BIT(registerRead(0xf241), 5) == 1) {
+    Serial.println("DQ[5] is 1");
+    if ( CHECK_BIT(registerRead(0xf240), 10) == 0) {
+      Serial.println("Successfuly erased block");
+    } else Serial.println("Erase FAILED");
+  } else Serial.println("DQ[5] is 0");  
+}
 
-
-/*void bootRAM () {
-  loadBuffer();
+void bootRAM () {
+  loadPage();
   for (int i = 0x200; i < 0x600; i++) {
-    readSector(i);
+    Serial.println(readSector(i, 1), HEX);
   }
-} */
+} 
+
+void writeSector(uint16_t address, uint16_t data) {
+  //dataDir(OUT);
+  ADDR2_PORT = (address >> 8);      // DataRAM0 start address 0x200 ~ 0x500 for total of 4 SECTORS
+  ADDR1_PORT = address & 0xFF;
+  DATA2_PORT = (data >> 8);      
+  DATA1_PORT = data & 0xFF;   
+  CONT_PORT &= ~(1<<WE);    // WE goes LOW
+  CONT_PORT |= (1<<WE);     // WE goes HIGH
+  
+}
+
     
 void testWrite() {
  dataDir(OUT);
@@ -205,17 +232,20 @@ void testWrite() {
  fpaSet(0x0000);
  registerSet(0xF200, 0x800); // BSA, BSC set
  for (int s = 0x200; s < 0x600; s++) {
-  writeSector(s, 0xAA);
- }
+  writeSector(s, random(0, 511));
+ } 
  registerSet(0xF220, 0x0080); // Write command
-  while ( (registerRead(0xF241) & (1<<15) )) {};
-  while ( (registerRead(0xF241) & (1<<6) )) {};
-  if ( registerRead(0xF240) & (1<<10))
+  while ( CHECK_BIT(registerRead(0xf241), 15) == 0) {};
+  while ( CHECK_BIT(registerRead(0xf241), 6) == 0) {};
+  if ( CHECK_BIT(registerRead(0xf240), 10) == 0) 
     Serial.println("Done writing");
  else 
     Serial.println("Writing failed!!!");
 }
 
+
+uint8_t state = S_IDLE, in_data;
+uint16_t block = 0;
 
 void setup() {
  
@@ -224,72 +254,68 @@ void setup() {
   MCUCR = (1<<JTD) | (0<<IVSEL) | (0<<IVCE) | (0<<PUD);
   contPortInit();
   addrInit();
-  Serial.begin(57600);
-  delay(10000);
+  Serial.begin(9600);
+  //delay(10000);
   coldReset();
   Serial.flush();
+  //_restart_Teensyduino_();
+  
+  
+  
+  
 }
+
 
 void loop() {
-  
- Serial.println(registerRead(0xF200), HEX);
- delay(1000);
- Serial.println(registerRead(0xF241), HEX);
- delay(1000);
- Serial.println(registerRead(MAN_ID), HEX);
- 
- 
-  
-   
+  /* registerSet(0xf24c, 0x000);  
+  registerSet(0xf220, 0x0023); 
+  Serial.println(registerRead(0xf241), HEX);
+  Serial.println(registerRead(0xf240), HEX);
+  while ( CHECK_BIT(registerRead(0xf241), 15) == 0 ) {};
+  while ( CHECK_BIT(registerRead(0xf240), 11) != 0 ) {};
+  fbaSet(0x3ff);
+  Serial.println(registerRead(0xF24E), HEX);
+  delay(1000); */
+  bootRAM();
+  while(1);
 }
 
+
+
   
- 
+
+  
+
+/*void loop() {
+
+  switch (state) {
+
+    case (S_IDLE):
+      if (Serial.available() > 0) {
+        in_data = Serial.read();
+        if (in_data == 0xAA)
+          state = S_READ;
+        if (in_data == 0xFF)
+          _restart_Teensyduino_();        
+      }
+      in_data = 0;
+      break;
     
-
-
-
-// OLD FUNCTIONS //
-/*uint8_t buf_read[64], buf_ix;
-void readSector(uint8_t address2, uint8_t address1) {
-  dataDir(IN);
-  ADDR2_PORT = address2;
-  ADDR1_PORT = address1;
-  CONT_PORT &= ~(1<<AVD); // AVD goes LOW
-  //delayMicroseconds(1);
-  CONT_PORT &= ~(1<<OE); // OE goes LOW
-  //delayMicroseconds(1);
-  _delay_ns(100);
-  buf_read[buf_ix++] = DATA2_PIN;
-  buf_read[buf_ix++] = DATA1_PIN;
-  //Serial.write(DATA2_PIN);
-  //Serial.write(DATA1_PIN);
-  CONT_PORT |= (1<<AVD); // AVD goes HIGH
-  CONT_PORT |= (1<<OE); // OE goes HIGH
-  //delayMicroseconds(1);
-  if (buf_ix == 64) {
-    Serial.write(buf_read, buf_ix);
-    buf_ix = 0;
+    case (S_READ):
+      if (block == 1024)
+        break;
+      fbaSet(block++);
+      for (int page = 0; page < 0x40; page++) { 
+        loadPage(); 
+        for (int sector = 0x200; sector < 0x600; sector++) {
+          readSector(sector, 0);
+        }
+      }
+      state = S_IDLE;
+      //in_data = 0;
+      break;
+    default:
+      break;
   }
-}
-
-void loadBuffer() {
-  dataDir(OUT);
-  ADDR2_PORT = ADDR1_PORT = 0x00;
-  DATA2_PORT = 0x00;
-  DATA1_PORT = 0xE0;
-  CONT_PORT &= ~(1<<WE);    // WE goes LOW
- //delayMicroseconds(1);
-  CONT_PORT |= (1<<WE);     // WE goes HIGH
-  //delayMicroseconds(1);
-  DATA2_PORT = 0x00;
-  DATA1_PORT = 0x00;
-  CONT_PORT &= ~(1<<WE);    // WE goes LOW
-  //delayMicroseconds(1);
-  CONT_PORT |= (1<<WE);     // WE goes HIGH
-  delayMicroseconds(60);
-}
-
-
-*/
-  
+} */
+    
